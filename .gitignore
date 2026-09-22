@@ -7,3 +7,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 单测判定日志（每次运行重新生成）
+tests/logs/
+
+# 本地运行产生的状态文件
+control_plane_state.json
