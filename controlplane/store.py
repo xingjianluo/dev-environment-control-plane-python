@@ -3,13 +3,19 @@
 On-disk layout::
 
     {
-      "version": 2,
+      "version": 3,
       "environments": [ {record fields...}, ... ],
-      "request_index": {request_id: env_id}
+      "request_index": {request_id: env_id},
+      "conclusions": [ {conclusion fields...}, ... ]
     }
 
 Older records may lack fields introduced later; such fields are filled with
 deterministic defaults (see FIELD_DEFAULTS and normalize_record).
+
+Version-2 files have no ``conclusions`` key. On load, ACCEPTED conclusions
+are backfilled from ``request_index`` + ``environments`` so that requests
+accepted before the upgrade keep replaying their original conclusion and
+remain queryable through the same interface.
 """
 from __future__ import annotations
 
@@ -19,9 +25,9 @@ import tempfile
 import threading
 from typing import Any
 
-from .models import EnvironmentRecord
+from .models import ConclusionOutcome, EnvironmentRecord, RequestConclusion
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Deterministic defaults applied when loading records written by older versions
 # that did not yet contain these fields.
@@ -39,6 +45,34 @@ FIELD_DEFAULTS: dict[str, Any] = {
 }
 
 REQUIRED_FIELDS = ("env_id", "owner", "request_id", "state", "created_at")
+
+# Deterministic defaults for conclusion records written by older versions.
+CONCLUSION_DEFAULTS: dict[str, Any] = {
+    "env_id": None,
+    "code": None,
+    "reason": None,
+}
+
+
+def normalize_conclusion(raw: dict[str, Any]) -> RequestConclusion:
+    """Fill missing conclusion fields with deterministic defaults."""
+    missing = [
+        f for f in ("request_id", "owner", "outcome", "decided_at") if f not in raw
+    ]
+    if missing:
+        raise ValueError(f"conclusion missing required fields: {missing}")
+    data = dict(raw)
+    for field_name, default in CONCLUSION_DEFAULTS.items():
+        data.setdefault(field_name, default)
+    return RequestConclusion(
+        request_id=data["request_id"],
+        owner=data["owner"],
+        outcome=data["outcome"],
+        decided_at=data["decided_at"],
+        env_id=data.get("env_id"),
+        code=data.get("code"),
+        reason=data.get("reason"),
+    )
 
 
 def normalize_record(raw: dict[str, Any]) -> EnvironmentRecord:
@@ -85,6 +119,7 @@ class Store:
         self.lock = threading.RLock()
         self.environments: dict[str, EnvironmentRecord] = {}
         self.request_index: dict[str, str] = {}
+        self.conclusions: dict[str, RequestConclusion] = {}
         self._load()
 
     def _load(self) -> None:
@@ -96,6 +131,32 @@ class Store:
             record = normalize_record(raw)
             self.environments[record.env_id] = record
         self.request_index = dict(payload.get("request_index", {}))
+        for raw in payload.get("conclusions", []):
+            conclusion = normalize_conclusion(raw)
+            self.conclusions[conclusion.request_id] = conclusion
+        self._backfill_legacy_conclusions()
+
+    def _backfill_legacy_conclusions(self) -> None:
+        """Reconstruct ACCEPTED conclusions for pre-v3 state files.
+
+        Version-2 files only recorded successful requests (request_index ->
+        env_id). Each such request gets an ACCEPTED conclusion whose
+        decided_at falls back to the environment's created_at, so upgraded
+        deployments keep returning the original conclusion and can query it.
+        """
+        for request_id, env_id in self.request_index.items():
+            if request_id in self.conclusions:
+                continue
+            rec = self.environments.get(env_id)
+            if rec is None:
+                continue
+            self.conclusions[request_id] = RequestConclusion(
+                request_id=request_id,
+                owner=rec.owner,
+                outcome=ConclusionOutcome.ACCEPTED.value,
+                decided_at=rec.created_at,
+                env_id=env_id,
+            )
 
     def save(self) -> None:
         """Atomically persist current state (write temp file then os.replace)."""
@@ -110,6 +171,7 @@ class Store:
                             "version": SCHEMA_VERSION,
                             "environments": [r.to_dict() for r in self.environments.values()],
                             "request_index": self.request_index,
+                            "conclusions": [c.to_dict() for c in self.conclusions.values()],
                         },
                         fh,
                         ensure_ascii=False,
@@ -127,4 +189,5 @@ class Store:
             return {
                 "environments": {k: v.to_dict() for k, v in self.environments.items()},
                 "request_index": dict(self.request_index),
+                "conclusions": {k: v.to_dict() for k, v in self.conclusions.items()},
             }

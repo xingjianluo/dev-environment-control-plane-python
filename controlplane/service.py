@@ -120,8 +120,19 @@ def create_app(
 
     @app.get("/requests/{request_id}")
     def get_request(request_id: str) -> dict[str, Any]:
-        rec = manager.get_by_request(request_id)
-        return {"request_id": request_id, **rec.to_dict()}
+        """Query the immutable conclusion of one request_id.
+
+        ACCEPTED conclusions also embed the live environment record (keeping
+        the historical response shape); REJECTED conclusions carry the stable
+        code/reason and decided_at. A request_id that was never submitted
+        still raises UNKNOWN_REQUEST (404), distinct from a recorded rejection.
+        """
+        conclusion = manager.get_conclusion(request_id)
+        body = conclusion.to_dict()
+        if conclusion.env_id is not None:
+            rec = manager.get_by_request(request_id)
+            body.update(rec.to_dict())
+        return body
 
     @app.get("/quota")
     def quota() -> dict[str, Any]:

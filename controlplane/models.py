@@ -33,6 +33,36 @@ class RejectCode(str, Enum):
     INVALID_REQUEST = "INVALID_REQUEST"
 
 
+class ConclusionOutcome(str, Enum):
+    """The two possible terminal conclusions for one request_id."""
+
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+
+
+@dataclass
+class RequestConclusion:
+    """The immutable, persisted conclusion of one request_id.
+
+    Once written it never changes: a later submission of the same request_id
+    replays this record verbatim, regardless of how capacity has evolved.
+    A REJECTED conclusion consumes no quota; it only records that this
+    request_id was turned away, with the stable code/reason and the time the
+    conclusion was made.
+    """
+
+    request_id: str
+    owner: str
+    outcome: str  # ConclusionOutcome value
+    decided_at: str
+    env_id: str | None = None  # set iff outcome == ACCEPTED
+    code: str | None = None  # RejectCode value, set iff outcome == REJECTED
+    reason: str | None = None  # human-readable rejection reason
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class ControlPlaneError(Exception):
     """Domain error carrying a stable rejection code and an explanatory message."""
 
@@ -96,6 +126,7 @@ class Decision:
     deduplicated: bool = False
     quota_after: dict[str, Any] | None = None
     lease_expires_at: str | None = None
+    decided_at: str | None = None  # when the persisted conclusion was made
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
