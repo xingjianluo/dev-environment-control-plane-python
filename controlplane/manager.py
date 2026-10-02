@@ -15,9 +15,10 @@ from .models import (
     ApplyRequest,
     ControlPlaneError,
     Decision,
-    EnvState,
     EnvironmentRecord,
+    EnvState,
     RejectCode,
+    RequestConclusion,
 )
 from .store import Store
 
@@ -99,6 +100,7 @@ class ControlPlaneManager:
         code: RejectCode | None = None,
         reason: str | None = None,
         deduplicated: bool = False,
+        decided_at: str | None = None,
     ) -> Decision:
         return Decision(
             accepted=accepted,
@@ -111,6 +113,7 @@ class ControlPlaneManager:
             deduplicated=deduplicated,
             quota_after=self._quota_view(),
             lease_expires_at=rec.lease_expires_at if rec else None,
+            decided_at=decided_at,
         )
 
     def _get_by_env(self, env_id: str) -> EnvironmentRecord:
@@ -130,12 +133,131 @@ class ControlPlaneManager:
 
     # ------------------------------------------------------------- lifecycle
 
+    def _replay_conclusion(
+        self,
+        conclusion: RequestConclusion,
+        *,
+        before: dict[str, Any],
+    ) -> Decision:
+        """Render a previously-made (and therefore immutable) verdict.
+
+        An ACCEPTED verdict reports the environment's *live* state (it may have
+        moved PENDING -> ACTIVE -> RELEASED since), but identity (env_id) and
+        acceptance never change. A REJECTED verdict replays the exact frozen
+        code/reason/decided_at: later quota releases can never flip it.
+        """
+        if conclusion.accepted:
+            rec = None
+            if conclusion.env_id is not None:
+                rec = self.store.environments.get(conclusion.env_id)
+            if rec is None:
+                # Defensive: an accepted verdict must always have its env.
+                raise ControlPlaneError(
+                    RejectCode.UNKNOWN_REQUEST,
+                    f"accepted verdict for '{conclusion.request_id}' has no environment",
+                )
+            decision = self._decision(
+                rec,
+                accepted=True,
+                deduplicated=True,
+                decided_at=conclusion.decided_at,
+                reason="duplicate request_id; returning existing environment",
+            )
+            log_decision(
+                self.logger,
+                request_id=conclusion.request_id,
+                action="APPLY",
+                accepted=True,
+                basis="frozen ACCEPTED verdict -> replay same env",
+                quota_before=before,
+                quota_after=decision.quota_after,
+                env_id=rec.env_id,
+                decided_at=conclusion.decided_at,
+                deduplicated=True,
+            )
+            return decision
+
+        decision = Decision(
+            accepted=False,
+            request_id=conclusion.request_id,
+            owner=conclusion.owner,
+            code=conclusion.code,
+            reason=conclusion.reason,
+            deduplicated=True,
+            quota_after=self._quota_view(),
+            decided_at=conclusion.decided_at,
+        )
+        log_decision(
+            self.logger,
+            request_id=conclusion.request_id,
+            action="APPLY",
+            accepted=False,
+            basis="frozen REJECTED verdict -> replay same rejection",
+            quota_before=before,
+            quota_after=decision.quota_after,
+            code=conclusion.code,
+            decided_at=conclusion.decided_at,
+            deduplicated=True,
+        )
+        return decision
+
+    def _reject_and_freeze(
+        self,
+        req: ApplyRequest,
+        code: RejectCode,
+        reason: str,
+        basis: str,
+        *,
+        before: dict[str, Any],
+    ) -> Decision:
+        """Persist a rejection as the immutable verdict for this request_id.
+
+        Rejections never reserve quota; they only consume a row in the
+        decisions table so the verdict is stable and queryable forever.
+        """
+        now_iso = _iso(self._now())
+        conclusion = RequestConclusion(
+            request_id=req.request_id,
+            accepted=False,
+            owner=req.owner,
+            decided_at=now_iso,
+            code=code.value,
+            reason=reason,
+        )
+        self.store.decisions[req.request_id] = conclusion
+        self.store.save()
+        decision = Decision(
+            accepted=False,
+            request_id=req.request_id,
+            owner=req.owner,
+            code=code.value,
+            reason=reason,
+            quota_after=self._quota_view(),
+            decided_at=now_iso,
+        )
+        log_decision(
+            self.logger,
+            request_id=req.request_id,
+            action="APPLY",
+            accepted=False,
+            basis=basis,
+            quota_before=before,
+            quota_after=decision.quota_after,
+            code=code.value,
+            decided_at=now_iso,
+        )
+        return decision
+
     def apply(self, req: ApplyRequest) -> Decision:
         """Allocate one environment for an idempotency key (request_id).
 
-        Duplicate/concurrent submission of the same request_id returns the
-        existing result exactly once created; quota is checked while holding
-        the single state lock so concurrent applicants cannot oversubscribe.
+        The verdict for a request_id is produced at most once and is then
+        frozen: a duplicate/later/concurrent submission replays the same
+        verdict. Granted requests keep returning the same environment; rejected
+        requests (owner/global quota exhausted) keep returning the same frozen
+        rejection even after quota frees up. All evaluation happens while
+        holding the single state lock, so concurrent applicants converge on one
+        verdict and never oversubscribe.
         """
         if not req.request_id or not req.owner:
             raise ControlPlaneError(
@@ -147,92 +269,59 @@ class ControlPlaneManager:
             )
         with self.store.lock:
             before = self._quota_view()
-            existing_id = self.store.request_index.get(req.request_id)
-            if existing_id is not None:
-                rec = self.store.environments[existing_id]
-                decision = self._decision(
-                    rec,
-                    accepted=True,
-                    deduplicated=True,
-                    reason="duplicate request_id; returning existing environment",
-                )
-                log_decision(
-                    self.logger,
-                    request_id=req.request_id,
-                    action="APPLY",
-                    accepted=True,
-                    basis="request_id already mapped -> return same env",
-                    quota_before=before,
-                    quota_after=decision.quota_after,
-                    env_id=rec.env_id,
-                    deduplicated=True,
-                )
-                return decision
+
+            existing = self.store.decisions.get(req.request_id)
+            if existing is not None:
+                return self._replay_conclusion(existing, before=before)
 
             owner_used = self._quota_view()["owners"].get(req.owner, {}).get("used", 0)
             if owner_used >= self.per_owner_limit:
-                decision = Decision(
-                    accepted=False,
-                    request_id=req.request_id,
-                    owner=req.owner,
-                    code=RejectCode.OWNER_QUOTA_EXHAUSTED.value,
-                    reason=(
+                return self._reject_and_freeze(
+                    req,
+                    RejectCode.OWNER_QUOTA_EXHAUSTED,
+                    (
                         f"owner quota exhausted: {owner_used}/"
                         f"{self.per_owner_limit} environments in use by '{req.owner}'"
                     ),
-                    quota_after=self._quota_view(),
+                    f"owner used {owner_used} >= per-owner limit {self.per_owner_limit}",
+                    before=before,
                 )
-                log_decision(
-                    self.logger,
-                    request_id=req.request_id,
-                    action="APPLY",
-                    accepted=False,
-                    basis=f"owner used {owner_used} >= per-owner limit {self.per_owner_limit}",
-                    quota_before=before,
-                    quota_after=decision.quota_after,
-                    code=decision.code,
-                )
-                return decision
 
             view = self._quota_view()
             if view["global"]["used"] >= self.global_limit:
-                decision = Decision(
-                    accepted=False,
-                    request_id=req.request_id,
-                    owner=req.owner,
-                    code=RejectCode.GLOBAL_QUOTA_EXHAUSTED.value,
-                    reason=(
+                return self._reject_and_freeze(
+                    req,
+                    RejectCode.GLOBAL_QUOTA_EXHAUSTED,
+                    (
                         f"global quota exhausted: {view['global']['used']}/"
                         f"{self.global_limit} environments in use"
                     ),
-                    quota_after=view,
+                    f"global used {view['global']['used']} >= limit {self.global_limit}",
+                    before=before,
                 )
-                log_decision(
-                    self.logger,
-                    request_id=req.request_id,
-                    action="APPLY",
-                    accepted=False,
-                    basis=f"global used {view['global']['used']} >= limit {self.global_limit}",
-                    quota_before=before,
-                    quota_after=view,
-                    code=decision.code,
-                )
-                return decision
 
             now = self._now()
+            now_iso = _iso(now)
             rec = EnvironmentRecord(
                 env_id=self._new_env_id(),
                 owner=req.owner,
                 request_id=req.request_id,
                 state=EnvState.PENDING.value,
                 lease_seconds=req.lease_seconds,
-                created_at=_iso(now),
-                updated_at=_iso(now),
+                created_at=now_iso,
+                updated_at=now_iso,
             )
             self.store.environments[rec.env_id] = rec
             self.store.request_index[req.request_id] = rec.env_id
+            self.store.decisions[req.request_id] = RequestConclusion(
+                request_id=req.request_id,
+                accepted=True,
+                owner=req.owner,
+                decided_at=now_iso,
+                env_id=rec.env_id,
+            )
             self.store.save()
-            decision = self._decision(rec, accepted=True)
+            decision = self._decision(rec, accepted=True, decided_at=now_iso)
             log_decision(
                 self.logger,
                 request_id=req.request_id,
@@ -242,6 +331,7 @@ class ControlPlaneManager:
                 quota_before=before,
                 quota_after=decision.quota_after,
                 env_id=rec.env_id,
+                decided_at=now_iso,
             )
             return decision
 
@@ -411,6 +501,47 @@ class ControlPlaneManager:
             return decision
 
     # ----------------------------------------------------------------- views
+
+    def get_conclusion(self, request_id: str) -> RequestConclusion:
+        """Return the frozen verdict for a request_id, rejected ones included.
+
+        Raises UNKNOWN_REQUEST when the id was never submitted, so callers can
+        unambiguously distinguish 'never submitted' from 'submitted/rejected'.
+        """
+        with self.store.lock:
+            conclusion = self.store.decisions.get(request_id)
+            if conclusion is None:
+                raise ControlPlaneError(
+                    RejectCode.UNKNOWN_REQUEST,
+                    f"no conclusion exists for request '{request_id}'",
+                )
+            return conclusion
+
+    def request_view(self, request_id: str) -> dict[str, Any]:
+        """Serializable view of a request's verdict plus live env state.
+
+        Accepted requests embed the environment's current record (state may
+        have advanced); rejected requests only carry the frozen rejection.
+        """
+        with self.store.lock:
+            conclusion = self.get_conclusion(request_id)
+            payload: dict[str, Any] = {
+                "request_id": conclusion.request_id,
+                "accepted": conclusion.accepted,
+                "owner": conclusion.owner,
+                "code": conclusion.code,
+                "reason": conclusion.reason,
+                "decided_at": conclusion.decided_at,
+                "env_id": conclusion.env_id,
+                "state": None,
+                "lease_expires_at": None,
+            }
+            if conclusion.accepted and conclusion.env_id is not None:
+                rec = self.store.environments.get(conclusion.env_id)
+                if rec is not None:
+                    payload["state"] = rec.state
+                    payload["lease_expires_at"] = rec.lease_expires_at
+            return payload
 
     def get_by_request(self, request_id: str) -> EnvironmentRecord:
         with self.store.lock:

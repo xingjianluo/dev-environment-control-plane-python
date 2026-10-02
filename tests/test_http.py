@@ -38,6 +38,41 @@ def test_duplicate_apply_http_returns_same_env(client):
     assert b2["deduplicated"] is True
 
 
+def test_rejected_request_is_queryable_and_frozen_http(client):
+    _apply(client, "r1", "alice")
+    denied = _apply(client, "r2", "alice")
+    assert denied.status_code == 409
+    body = denied.json()
+    assert body["code"] == "OWNER_QUOTA_EXHAUSTED"
+    assert body["decided_at"]
+
+    # rejected verdict is retrievable by id afterwards
+    view = client.get("/requests/r2")
+    assert view.status_code == 200
+    v = view.json()
+    assert v["accepted"] is False
+    assert v["code"] == "OWNER_QUOTA_EXHAUSTED"
+    assert v["reason"] == body["reason"]
+    assert v["decided_at"] == body["decided_at"]
+    assert v["env_id"] is None
+
+    # an id never submitted stays a distinct 404
+    missing = client.get("/requests/never-submitted")
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "UNKNOWN_REQUEST"
+
+    # free capacity, then replay the same rejected id: still the frozen verdict
+    env_id = client.get("/requests/r1").json()["env_id"]
+    client.post(f"/environments/{env_id}/release", json={"owner": "alice"})
+    replay = _apply(client, "r2", "alice")
+    assert replay.status_code == 409
+    rj = replay.json()
+    assert rj["deduplicated"] is True
+    assert rj["code"] == "OWNER_QUOTA_EXHAUSTED"
+    assert rj["reason"] == body["reason"]
+    assert rj["decided_at"] == body["decided_at"]
+
+
 def test_quota_exhaustion_http_codes(client):
     _apply(client, "x1", "alice")
     _apply(client, "x2", "bob")

@@ -71,6 +71,28 @@ class EnvironmentRecord:
 
 
 @dataclass
+class RequestConclusion:
+    """The once-made, permanently frozen verdict for one request_id.
+
+    A conclusion is produced exactly once: either an environment was granted
+    (accepted=True) or the request was rejected with a stable code/reason
+    (accepted=False). It is persisted and never changes afterwards, regardless
+    of later quota movements or process restarts.
+    """
+
+    request_id: str
+    accepted: bool
+    owner: str
+    decided_at: str
+    env_id: str | None = None
+    code: str | None = None
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ApplyRequest:
     request_id: str
     owner: str
@@ -96,6 +118,7 @@ class Decision:
     deduplicated: bool = False
     quota_after: dict[str, Any] | None = None
     lease_expires_at: str | None = None
+    decided_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -1,12 +1,23 @@
 """JSON-file persistence with atomic writes and backward-compatible reads.
 
-On-disk layout::
+On-disk layout (v3)::
 
     {
-      "version": 2,
+      "version": 3,
       "environments": [ {record fields...}, ... ],
-      "request_index": {request_id: env_id}
+      "request_index": {request_id: env_id},
+      "decisions": [ {request conclusion fields...}, ... ]
     }
+
+The ``decisions`` table stores the *once-made verdict* per request_id
+(accepted-with-env, or rejected-with-code). Verdicts are immutable and
+survive restarts; a rejected request is therefore queryable forever.
+
+v1/v2 files have no ``decisions`` table. On load, an ACCEPTED conclusion is
+backfilled for every request_id already mapped to an environment (the env's
+``created_at`` is used as the verdict time). Rejected verdicts did not exist
+before v3, so absence is unambiguous: not in ``decisions`` means "never
+submitted under the new rules".
 
 Older records may lack fields introduced later; such fields are filled with
 deterministic defaults (see FIELD_DEFAULTS and normalize_record).
@@ -19,9 +30,9 @@ import tempfile
 import threading
 from typing import Any
 
-from .models import EnvironmentRecord
+from .models import EnvironmentRecord, RequestConclusion
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Deterministic defaults applied when loading records written by older versions
 # that did not yet contain these fields.
@@ -39,6 +50,8 @@ FIELD_DEFAULTS: dict[str, Any] = {
 }
 
 REQUIRED_FIELDS = ("env_id", "owner", "request_id", "state", "created_at")
+
+CONCLUSION_REQUIRED_FIELDS = ("request_id", "accepted", "owner", "decided_at")
 
 
 def normalize_record(raw: dict[str, Any]) -> EnvironmentRecord:
@@ -77,6 +90,23 @@ def normalize_record(raw: dict[str, Any]) -> EnvironmentRecord:
     )
 
 
+def normalize_conclusion(raw: dict[str, Any]) -> RequestConclusion:
+    """Build a RequestConclusion from persisted JSON, tolerating extra/missing
+    optional fields. Only the core identity fields must be present."""
+    missing = [f for f in CONCLUSION_REQUIRED_FIELDS if f not in raw]
+    if missing:
+        raise ValueError(f"conclusion missing required fields: {missing}")
+    return RequestConclusion(
+        request_id=raw["request_id"],
+        accepted=bool(raw["accepted"]),
+        owner=raw["owner"],
+        decided_at=raw["decided_at"],
+        env_id=raw.get("env_id"),
+        code=raw.get("code"),
+        reason=raw.get("reason"),
+    )
+
+
 class Store:
     """Holds all state in memory and persists it atomically to a JSON file."""
 
@@ -85,6 +115,7 @@ class Store:
         self.lock = threading.RLock()
         self.environments: dict[str, EnvironmentRecord] = {}
         self.request_index: dict[str, str] = {}
+        self.decisions: dict[str, RequestConclusion] = {}
         self._load()
 
     def _load(self) -> None:
@@ -96,6 +127,29 @@ class Store:
             record = normalize_record(raw)
             self.environments[record.env_id] = record
         self.request_index = dict(payload.get("request_index", {}))
+        for raw in payload.get("decisions", []):
+            conclusion = normalize_conclusion(raw)
+            self.decisions[conclusion.request_id] = conclusion
+        self._backfill_legacy_decisions()
+
+    def _backfill_legacy_decisions(self) -> None:
+        """v1/v2 files predate the decisions table: every request that already
+        owned an environment is deterministically recorded as an ACCEPTED
+        verdict (verdict time = environment creation time). No rejected
+        verdicts are fabricated; they cannot exist in those versions."""
+        for request_id, env_id in self.request_index.items():
+            if request_id in self.decisions:
+                continue
+            rec = self.environments.get(env_id)
+            if rec is None:
+                continue
+            self.decisions[request_id] = RequestConclusion(
+                request_id=request_id,
+                accepted=True,
+                owner=rec.owner,
+                decided_at=rec.created_at,
+                env_id=env_id,
+            )
 
     def save(self) -> None:
         """Atomically persist current state (write temp file then os.replace)."""
@@ -110,6 +164,7 @@ class Store:
                             "version": SCHEMA_VERSION,
                             "environments": [r.to_dict() for r in self.environments.values()],
                             "request_index": self.request_index,
+                            "decisions": [c.to_dict() for c in self.decisions.values()],
                         },
                         fh,
                         ensure_ascii=False,
@@ -127,4 +182,5 @@ class Store:
             return {
                 "environments": {k: v.to_dict() for k, v in self.environments.items()},
                 "request_index": dict(self.request_index),
+                "decisions": {k: v.to_dict() for k, v in self.decisions.items()},
             }

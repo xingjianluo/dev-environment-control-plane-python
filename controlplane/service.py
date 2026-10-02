@@ -120,8 +120,10 @@ def create_app(
 
     @app.get("/requests/{request_id}")
     def get_request(request_id: str) -> dict[str, Any]:
-        rec = manager.get_by_request(request_id)
-        return {"request_id": request_id, **rec.to_dict()}
+        # Returns the frozen verdict for the id, rejected requests included:
+        # accepted -> env_id plus live env state; rejected -> code/reason/
+        # decided_at; never submitted -> 404 UNKNOWN_REQUEST.
+        return manager.request_view(request_id)
 
     @app.get("/quota")
     def quota() -> dict[str, Any]:
