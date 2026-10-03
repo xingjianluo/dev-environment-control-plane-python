@@ -520,8 +520,13 @@ class ControlPlaneManager:
     def request_view(self, request_id: str) -> dict[str, Any]:
         """Serializable view of a request's verdict plus live env state.
 
-        Accepted requests embed the environment's current record (state may
-        have advanced); rejected requests only carry the frozen rejection.
+        Accepted requests embed the environment's *full* current record: every
+        historical field (created_at/updated_at/lease_seconds, the occupy/
+        release/reclaim timestamps and all four counters) is always present,
+        at every lifecycle stage, with the conclusion fields (accepted/
+        decided_at/code/reason) added on top. Rejected requests keep their
+        own stable, smaller field set (frozen rejection only); a never
+        submitted id raises UNKNOWN_REQUEST.
         """
         with self.store.lock:
             conclusion = self.get_conclusion(request_id)
@@ -539,8 +544,10 @@ class ControlPlaneManager:
             if conclusion.accepted and conclusion.env_id is not None:
                 rec = self.store.environments.get(conclusion.env_id)
                 if rec is not None:
-                    payload["state"] = rec.state
-                    payload["lease_expires_at"] = rec.lease_expires_at
+                    # Original per-environment fields, restored in full; the
+                    # verdict fields above are additive and never replace them.
+                    payload.update(rec.to_dict())
+                    payload["owner"] = rec.owner
             return payload
 
     def get_by_request(self, request_id: str) -> EnvironmentRecord:

@@ -42,7 +42,7 @@ uv run uvicorn main:app --reload
 | `POST /environments/{env_id}/reclaim` | 系统回收（仅租约已到期的 ACTIVE） |
 | `GET  /environments/{env_id}` | 查询单个环境 |
 | `GET  /environments?owner=alice` | 列表，可按 owner 过滤 |
-| `GET  /requests/{request_id}` | 按幂等键查询**冻结结论**（成功带 env 实时状态；被拒带 code/reason/decided_at；未提交 404） |
+| `GET  /requests/{request_id}` | 按幂等键查询结论与环境全貌（成功：完整环境记录 + 结论字段；被拒：冻结拒绝；未提交 404，详见下文返回约定） |
 | `GET  /quota` | 当前全局/各 owner 配额用量 |
 
 申请请求示例：
@@ -80,6 +80,31 @@ curl -s -X POST localhost:8000/environments/apply \
   生成一条结论，所有调用方拿到的 `env_id`（成功）或 `code/reason/decided_at`（拒绝）完全一致。
 - 入参非法（空 `request_id`/`owner`、非正租约）在进入判定前直接返回 `INVALID_REQUEST`，
   不产生结论、不占用该 id。
+
+## 按标识查询的返回约定（`GET /requests/{request_id}`）
+
+该接口按 `accepted` 分两种**各自稳定**的返回结构，字段名、取值范围与类型固定不变：
+
+**成功（`accepted=true`，HTTP 200）**——在生命周期的任何阶段（PENDING/ACTIVE/续约后/
+RELEASED/RECLAIMED）都返回同一套完整字段：
+
+| 类别 | 字段 |
+| --- | --- |
+| 原有环境字段（必须保留，一个不少） | `env_id`、`owner`、`request_id`、`state`、`lease_seconds`(int)、`created_at`、`updated_at`、`lease_expires_at`、`occupied_at`、`released_at`、`reclaimed_at`（时间字段为 ISO-8601 字符串或 `null`）、`occupy_count`、`release_count`、`reclaim_count`、`renew_count`（计数均为 int ≥ 0） |
+| 新增结论字段（附加，不替换老字段） | `accepted`(=`true`)、`decided_at`（结论时间）、`code`(=`null`)、`reason`(=`null`) |
+
+其中 `state`、`lease_expires_at`、各计数是**实时值**（环境可能已走到 ACTIVE/RELEASED/
+RECLAIMED），`created_at` 等历史时间点一旦写入不再变化；`env_id` 与 `accepted` 永久固定。
+
+**被拒（`accepted=false`，HTTP 200）**——字段集合保持冻结拒绝时的原样，不随成功路径变化：
+`request_id`、`accepted`、`owner`、`code`、`reason`、`decided_at`、`env_id`(=`null`)、
+`state`(=`null`)、`lease_expires_at`(=`null`)。
+
+**从未提交（HTTP 404）**——`{"accepted": false, "code": "UNKNOWN_REQUEST", "reason": ...}`，
+与“被拒过”的 200 响应严格区分。
+
+一致性保证：同一 id 无论并发查询多少方、是否重启过进程，返回的字段集合与取值完全一致；
+重启后从状态文件重建的视图与重启前逐字段相同。
 
 ## 状态机
 
@@ -164,6 +189,8 @@ curl -s -X POST localhost:8000/environments/apply \
 
 也就是说：**升级后老的成功请求在同样的地方（`GET /requests/{request_id}`）可查，
 语义不变；“从未提交”与“被拒过”的区分只对升级后产生的结论有意义。**
+老记录按上表缺省值补齐后，按标识查询同样返回完整字段集合（缺失的计数为 0、
+时间点为 `null`），不会出现“老数据查出来少字段”的情况。
 
 ### 环境记录缺省值（v1/v2 记录缺字段）
 
@@ -197,14 +224,28 @@ curl -s -X POST localhost:8000/environments/apply \
 ## 本地验证
 
 ```bash
-uv run pytest -q                       # 全量单测（44 项）
-uv run pytest tests/test_decisions.py # 结论冻结/重启恢复/并发收敛/兼容回填
-uv run pytest tests/test_quota.py     # 仅并发争抢/配额
-uv run pytest tests/test_lease.py     # 仅租约回收/兼容读取
+uv run pytest -q                          # 全量单测（54 项）
+uv run pytest -v                          # 逐用例列出各业务文件与通过情况
+uv run pytest tests/test_request_view.py  # 按标识查询的字段完整性/重启一致/并发收敛
+uv run pytest tests/test_decisions.py     # 结论冻结/重启恢复/并发收敛/兼容回填
+uv run pytest tests/test_quota.py         # 仅并发争抢/配额
+uv run pytest tests/test_lease.py         # 仅租约回收/兼容读取
 ```
 
-测试覆盖（本轮新增见 `tests/test_decisions.py`）：
+测试覆盖（按标识查询的返回约定见 `tests/test_request_view.py`，结论冻结见 `tests/test_decisions.py`）：
 
+- **成功查询全生命周期字段完整**：申请后（PENDING）、占用后（ACTIVE）、续约后、释放后
+  （RELEASED）、回收后（RECLAIMED）按 id 查询，原有字段（`created_at`/`updated_at`/
+  `lease_seconds`/占用/释放/回收时间点/四项计数）一个不少，结论字段只增不替
+  （`test_view_after_apply_pending_keeps_all_original_fields` 等 5 个分阶段用例）；
+- **被拒与未提交可区分**：被拒 id 返回固定的拒绝字段集合，未提交 id 返回
+  `UNKNOWN_REQUEST`/404（`test_rejected_view_field_set_is_stable_and_distinct`、
+  `test_http_rejected_and_unknown_stay_distinguishable`）；
+- **重启前后查询逐字段一致**：同一状态文件重启后，成功与被拒两条查询结果与重启前完全相等，
+  重启后继续推进生命周期字段仍完整（`test_view_is_identical_before_and_after_restart`）；
+- **容量紧张时同 id 并发收敛**：全局仅剩一个名额时 16 线程同 id 争抢 + 16 线程并发查询，
+  所有观察者拿到字段集合与取值完全一致的完整视图
+  （`test_concurrent_same_id_at_capacity_boundary_views_converge`）；
 - **拒绝冻结、容量恢复后不翻盘**：同一 id 首次被拒，释放环境让出容量后再提交仍返回原
   `code/reason/decided_at`；同场景下新 id 正常成功（`test_rejected_verdict_is_frozen_after_quota_recovers`、
   `test_global_rejection_is_frozen_after_global_capacity_recovers`）；
@@ -223,6 +264,23 @@ uv run pytest tests/test_lease.py     # 仅租约回收/兼容读取
 ### 手工复现（curl）
 
 默认 `GLOBAL=2 / OWNER=1`，先启动：`uv run uvicorn main:app --reload`。
+
+**0) 验证“按标识查询在生命周期各阶段字段完整”**
+
+```bash
+curl -s -X POST localhost:8000/environments/apply -H 'Content-Type: application/json' \
+  -d '{"request_id":"v-1","owner":"alice","lease_seconds":30}'      # 200，记录 env_id
+curl -s localhost:8000/requests/v-1 | python -m json.tool           # PENDING：created_at/updated_at/lease_seconds/四个计数齐全
+curl -s -X POST localhost:8000/environments/<env_id>/occupy \
+  -H 'Content-Type: application/json' -d '{"owner":"alice"}'
+curl -s -X POST localhost:8000/environments/<env_id>/renew \
+  -H 'Content-Type: application/json' -d '{"owner":"alice"}'
+curl -s localhost:8000/requests/v-1 | python -m json.tool           # ACTIVE：occupied_at/lease_expires_at 已写入，occupy_count=1、renew_count=1
+curl -s -X POST localhost:8000/environments/<env_id>/release \
+  -H 'Content-Type: application/json' -d '{"owner":"alice"}'
+curl -s localhost:8000/requests/v-1 | python -m json.tool           # RELEASED：released_at 已写入，历史时间点与计数全部保留
+# Ctrl-C 停服再重启后重查 v-1：返回内容与重启前逐字段一致
+```
 
 **1) 构造“被拒 → 容量恢复 → 同 id 仍拒绝，新 id 成功”**
 
@@ -274,5 +332,5 @@ controlplane/store.py        # JSON 原子持久化、旧记录兼容归一化
 controlplane/manager.py      # 状态机、配额、租约、幂等判定（全部在锁内）
 controlplane/service.py      # HTTP 层、应用工厂、错误码→HTTP 状态映射
 controlplane/logging_util.py # 结构化判定日志
-tests/                       # 生命周期/配额/租约/HTTP/结论冻结 五组测试
+tests/                       # 生命周期/配额/租约/HTTP/结论冻结/按标识查询 六组测试
 ```
