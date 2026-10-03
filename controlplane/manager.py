@@ -520,28 +520,58 @@ class ControlPlaneManager:
     def request_view(self, request_id: str) -> dict[str, Any]:
         """Serializable view of a request's verdict plus live env state.
 
-        Accepted requests embed the environment's current record (state may
-        have advanced); rejected requests only carry the frozen rejection.
+        Accepted requests embed the environment's *full* current record: every
+        original field (created_at, updated_at, lease_seconds, occupied_at,
+        released_at, reclaimed_at and the occupy/release/reclaim/renew
+        counters) is returned with its historical name, type and value range,
+        at every lifecycle stage (PENDING/ACTIVE/RELEASED/RECLAIMED). The
+        conclusion fields (accepted/decided_at/code/reason) are added on top
+        and never replace or shadow the original ones.
+
+        Rejected requests keep their own stable field set (frozen rejection
+        only); it is deliberately different from the accepted shape so the
+        two outcomes stay trivially distinguishable.
         """
         with self.store.lock:
             conclusion = self.get_conclusion(request_id)
-            payload: dict[str, Any] = {
+            if conclusion.accepted:
+                rec = (
+                    self.store.environments.get(conclusion.env_id)
+                    if conclusion.env_id is not None
+                    else None
+                )
+                if rec is not None:
+                    # Original environment fields first, unchanged.
+                    payload = rec.to_dict()
+                else:
+                    # Defensive: an accepted verdict must always have its env.
+                    payload = {
+                        "env_id": conclusion.env_id,
+                        "owner": conclusion.owner,
+                        "request_id": conclusion.request_id,
+                        "state": None,
+                    }
+                # New conclusion fields are additive only.
+                payload.update(
+                    {
+                        "accepted": True,
+                        "code": None,
+                        "reason": None,
+                        "decided_at": conclusion.decided_at,
+                    }
+                )
+                return payload
+            return {
                 "request_id": conclusion.request_id,
-                "accepted": conclusion.accepted,
+                "accepted": False,
                 "owner": conclusion.owner,
                 "code": conclusion.code,
                 "reason": conclusion.reason,
                 "decided_at": conclusion.decided_at,
-                "env_id": conclusion.env_id,
+                "env_id": None,
                 "state": None,
                 "lease_expires_at": None,
             }
-            if conclusion.accepted and conclusion.env_id is not None:
-                rec = self.store.environments.get(conclusion.env_id)
-                if rec is not None:
-                    payload["state"] = rec.state
-                    payload["lease_expires_at"] = rec.lease_expires_at
-            return payload
 
     def get_by_request(self, request_id: str) -> EnvironmentRecord:
         with self.store.lock:
